@@ -1,0 +1,21 @@
+{
+  "name": "cf-d1-auto-deploy",
+  "version": "1.0.0",
+  "description": "Cloudflare Workers + D1 Database 自動化部署專案模板",
+  "main": "src/index.ts",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "d1:create": "wrangler d1 create app-db",
+    "d1:migrate:local": "wrangler d1 migrations apply app-db --local",
+    "d1:migrate:remote": "wrangler d1 migrations apply app-db --remote",
+    "d1:new-migration": "wrangler d1 migrations create app-db"
+  },
+  "dependencies": {
+    "@cloudflare/workers-types": "^5.20260929.1"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.4",
+    "wrangler": "^4.143.0"
+  }
+}

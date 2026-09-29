@@ -1,0 +1,17 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "cf-d1-auto-deploy",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-09-01",
+  "observability": {
+    "enabled": true
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "app-db",
+      "database_id": "999d567c-db55-404e-8f4c-40440b87d591",
+      "migrations_dir": "migrations"
+    }
+  ]
+}
