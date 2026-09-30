@@ -1,13 +1,13 @@
 {
-  "name": "math-4a-vertical-mult",
+  "name": "student-score-platform",
   "version": "1.0.0",
-  "description": "國小四年級數學【乘法直式計算】線上互動測驗與學生成績管理系統 (Cloudflare Workers + D1)",
+  "description": "學生各科成績自填與班級管理平台 (Cloudflare Workers + D1)",
   "main": "src/index.ts",
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
-    "d1:local": "wrangler d1 execute math-4a-vertical-mult-db --local --file=./migrations/0001_math_vertical_mult.sql",
-    "d1:remote": "wrangler d1 execute math-4a-vertical-mult-db --remote --file=./migrations/0001_math_vertical_mult.sql",
+    "d1:local": "wrangler d1 execute student-score-platform-db --local --file=./migrations/0001_student_score_platform.sql",
+    "d1:remote": "wrangler d1 execute student-score-platform-db --remote --file=./migrations/0001_student_score_platform.sql",
     "cf-typegen": "wrangler types"
   },
   "dependencies": {

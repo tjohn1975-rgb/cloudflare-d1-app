@@ -5,29 +5,43 @@ type Bindings = {
   DB: D1Database
 }
 
-interface QuizRecordRow {
+interface StudentRow {
   id: number
-  timestamp: string
-  student_class: string
-  seat_number: string
-  student_name: string
-  unit_mode: string
-  score: number
-  correct_count: number
-  total_questions: number
-  accuracy: number
-  time_spent: number
-  error_categories: string
-  wrong_questions: string
-  detail_logs: string
-  dim_stats_json: string
+  class_id: string
+  seat_no: string
+  name: string
+  password: string
+  status: string
+  updated_at: string
+}
+
+interface UnitRow {
+  unit_id: string
+  subject: string
+  unit_name: string
+  max_score: number
+  is_open: number
   created_at: string
+}
+
+interface ScoreRow {
+  id: number
+  record_id: string
+  submitted_at: string
+  class_id: string
+  seat_no: string
+  student_name: string
+  unit_id: string
+  subject: string
+  unit_name: string
+  score: number
+  note: string
 }
 
 const app = new Hono<{ Bindings: Bindings }>()
 
 // ============================================================================
-// 系統設定輔助函式 (Cloudflare D1 Key-Value 持久化)
+// 系統設定輔助函式
 // ============================================================================
 
 async function getSetting(db: D1Database, key: string, defaultVal: string): Promise<string> {
@@ -46,182 +60,153 @@ async function setSetting(db: D1Database, key: string, value: string): Promise<v
 }
 
 // ============================================================================
-// 後台完整學情數據計算 (KPI, 六大級距, 錯題排行榜, 安全狀態)
+// 後台資料運算核心 (學生名冊、單元設定、成績矩陣、統計指標)
 // ============================================================================
 
-async function computeDashboardData(db: D1Database) {
-  const { results } = await db.prepare(`
-    SELECT * FROM quiz_records 
-    ORDER BY score DESC, time_spent ASC, id DESC
-  `).all<QuizRecordRow>()
+async function computeTeacherDashboard(db: D1Database) {
+  // 1. 學生名冊
+  const { results: studentsRes } = await db.prepare(`
+    SELECT * FROM students 
+    ORDER BY CAST(seat_no AS INTEGER) ASC, seat_no ASC
+  `).all<StudentRow>()
+  const students = (studentsRes || []).map((s) => ({
+    classId: s.class_id,
+    seatNo: s.seat_no,
+    name: s.name,
+    password: s.password,
+    status: s.status,
+    updatedAt: s.updated_at
+  }))
 
-  const rows = results || []
-  const total = rows.length
-  let sumScore = 0
-  let maxScore = -1
+  // 2. 評量單元
+  const { results: unitsRes } = await db.prepare(`
+    SELECT * FROM units 
+    ORDER BY created_at ASC
+  `).all<UnitRow>()
+  const units = (unitsRes || []).map((u) => ({
+    unitId: u.unit_id,
+    subject: u.subject,
+    unitName: u.unit_name,
+    maxScore: u.max_score,
+    isOpen: u.is_open === 1,
+    createdAt: u.created_at
+  }))
+
+  // 3. 成績記錄
+  const { results: scoresRes } = await db.prepare(`
+    SELECT * FROM scores 
+    ORDER BY CAST(seat_no AS INTEGER) ASC, submitted_at DESC
+  `).all<ScoreRow>()
+  const allScores = scoresRes || []
+
+  // 建立成績矩陣 (以 classId_seatNo 為 key)
+  const scoreMatrix: Record<string, any> = {}
+  students.forEach((stu) => {
+    const key = `${stu.classId}_${stu.seatNo}`
+    scoreMatrix[key] = {
+      classId: stu.classId,
+      seatNo: stu.seatNo,
+      name: stu.name,
+      scores: {},
+      submittedCount: 0,
+      totalScore: 0,
+      averageScore: 0
+    }
+  })
+
+  let globalScoreSum = 0
+  let globalScoreCount = 0
+  let maxScore = 0
   let minScore = 999
-  let passCount = 0
 
-  let s100 = 0, s90 = 0, s80 = 0, s70 = 0, s60 = 0, sUnder60 = 0
+  // 統計單元指標
+  const unitStatsMap: Record<string, { total: number; sum: number; passCount: number }> = {}
+  units.forEach((u) => {
+    unitStatsMap[u.unitId] = { total: 0, sum: 0, passCount: 0 }
+  })
 
-  // 錯題統計累計映射
-  const errorMap: Record<string, {
-    id: string
-    title: string
-    dimension: string
-    category: string
-    totalCount: number
-    wrongCount: number
-    wrongStudents: string[]
-  }> = {}
-
-  const recentSubmissions = rows.map((r) => {
-    const sc = r.score || 0
-    sumScore += sc
-    if (sc > maxScore) maxScore = sc
-    if (sc < minScore) minScore = sc
-    if (sc >= 60) passCount++
-
-    if (sc === 100) s100++
-    else if (sc >= 90) s90++
-    else if (sc >= 80) s80++
-    else if (sc >= 70) s70++
-    else if (sc >= 60) s60++
-    else sUnder60++
-
-    // 解析錯題與作答細節
-    try {
-      const logs = JSON.parse(r.detail_logs || '[]')
-      if (Array.isArray(logs)) {
-        logs.forEach((log: any) => {
-          const qid = log.id || log.qid || log.questionId
-          if (!qid) return
-          if (!errorMap[qid]) {
-            errorMap[qid] = {
-              id: qid,
-              title: log.title || ('題目 ' + qid),
-              dimension: log.dimension || '運算技能',
-              category: log.category || '整數乘法直式計算',
-              totalCount: 0,
-              wrongCount: 0,
-              wrongStudents: []
-            }
-          }
-          errorMap[qid].totalCount++
-          if (log.isCorrect === false) {
-            errorMap[qid].wrongCount++
-            const stuStr = `${r.seat_number}號 ${r.student_name}`
-            if (!errorMap[qid].wrongStudents.includes(stuStr)) {
-              errorMap[qid].wrongStudents.push(stuStr)
-            }
-          }
-        })
+  allScores.forEach((r) => {
+    const key = `${r.class_id}_${r.seat_no}`
+    if (scoreMatrix[key]) {
+      scoreMatrix[key].scores[r.unit_id] = {
+        score: r.score,
+        time: r.submitted_at,
+        note: r.note || ''
       }
-    } catch (e) {
-      // 降級由 wrong_questions 解析
-      if (r.wrong_questions) {
-        const wIds = r.wrong_questions.split(',').map((s) => s.trim()).filter(Boolean)
-        wIds.forEach((wid) => {
-          if (!errorMap[wid]) {
-            errorMap[wid] = {
-              id: wid,
-              title: '題目 ' + wid,
-              dimension: '運算技能',
-              category: '整數乘法直式計算',
-              totalCount: total,
-              wrongCount: 0,
-              wrongStudents: []
-            }
-          }
-          errorMap[wid].wrongCount++
-          const stuStr = `${r.seat_number}號 ${r.student_name}`
-          if (!errorMap[wid].wrongStudents.includes(stuStr)) {
-            errorMap[wid].wrongStudents.push(stuStr)
-          }
-        })
-      }
+      scoreMatrix[key].submittedCount++
+      scoreMatrix[key].totalScore += r.score
     }
 
-    return {
-      rowIndex: r.id,
-      timestamp: r.timestamp || r.created_at,
-      studentClass: r.student_class || '402',
-      studentSeat: r.seat_number,
-      studentName: r.student_name,
-      unitMode: r.unit_mode || '全單元綜合',
-      score: sc,
-      correctCount: r.correct_count || 0,
-      totalQuestions: r.total_questions || 20,
-      accuracy: r.accuracy || 0,
-      timeSpent: r.time_spent || 0,
-      errorCategories: r.error_categories || '',
-      wrongQuestions: r.wrong_questions || '',
-      detailLogs: r.detail_logs || '[]'
+    globalScoreSum += r.score
+    globalScoreCount++
+    if (r.score > maxScore) maxScore = r.score
+    if (r.score < minScore) minScore = r.score
+
+    if (unitStatsMap[r.unit_id]) {
+      unitStatsMap[r.unit_id].total++
+      unitStatsMap[r.unit_id].sum += r.score
+      if (r.score >= 60) unitStatsMap[r.unit_id].passCount++
     }
   })
 
-  // 整理錯題統計
-  const questionStats = Object.values(errorMap).map((item) => {
-    const attempts = item.totalCount > 0 ? item.totalCount : total
-    const rate = attempts > 0 ? Math.round((item.wrongCount / attempts) * 100) : 0
-    return {
-      id: item.id,
-      dimension: item.dimension,
-      title: item.title,
-      category: item.category,
-      totalCount: attempts,
-      wrongCount: item.wrongCount,
-      errorRate: rate,
-      wrongStudents: item.wrongStudents.join(', ')
+  // 計算每位學生個人平均
+  let studentsWithSubmissions = 0
+  Object.values(scoreMatrix).forEach((item: any) => {
+    if (item.submittedCount > 0) {
+      item.averageScore = Math.round((item.totalScore / item.submittedCount) * 10) / 10
+      studentsWithSubmissions++
     }
   })
 
-  questionStats.sort((a, b) => b.errorRate - a.errorRate)
+  // 單元統計陣列
+  const unitStats = units.map((u) => {
+    const stat = unitStatsMap[u.unitId] || { total: 0, sum: 0, passCount: 0 }
+    return {
+      unitId: u.unitId,
+      subject: u.subject,
+      unitName: u.unitName,
+      submittedCount: stat.total,
+      averageScore: stat.total > 0 ? Math.round((stat.sum / stat.total) * 10) / 10 : 0,
+      passRate: stat.total > 0 ? Math.round((stat.passCount / stat.total) * 100) : 0
+    }
+  })
 
-  // 讀取進場門禁與安全狀態
-  const entryGateEnabled = (await getSetting(db, 'ENTRY_GATE_ENABLED', 'true')) === 'true'
-  const entryGatePassword = await getSetting(db, 'ENTRY_PASSWORD', '1234')
+  // 近期 50 筆紀錄
+  const recentRecords = allScores.slice(0, 50).map((r) => ({
+    id: r.id,
+    recordId: r.record_id,
+    time: r.submitted_at,
+    classId: r.class_id,
+    seatNo: r.seat_no,
+    name: r.student_name,
+    unitId: r.unit_id,
+    subject: r.subject,
+    unitName: r.unit_name,
+    score: r.score,
+    note: r.note
+  }))
 
-  const failedAttempts = Number(await getSetting(db, 'AUTH_FAILED_ATTEMPTS', '0')) || 0
-  const lockUntil = Number(await getSetting(db, 'AUTH_LOCK_UNTIL', '0')) || 0
-  const now = Date.now()
-  const isLocked = lockUntil > now
-  const remainingSec = isLocked ? Math.ceil((lockUntil - now) / 1000) : 0
-
+  const totalStudents = students.length
   return {
-    kpi: {
-      totalStudents: total,
-      avgScore: total > 0 ? Math.round((sumScore / total) * 10) / 10 : 0,
-      maxScore: maxScore >= 0 ? maxScore : 0,
-      minScore: minScore <= 100 ? minScore : 0,
-      passCount: passCount,
-      passRate: total > 0 ? Math.round((passCount / total) * 100) : 0
+    success: true,
+    students,
+    units,
+    scoreMatrix,
+    statistics: {
+      totalStudents,
+      submittedCount: studentsWithSubmissions,
+      averageScore: globalScoreCount > 0 ? Math.round((globalScoreSum / globalScoreCount) * 10) / 10 : 0,
+      highestScore: globalScoreCount > 0 ? maxScore : 0,
+      lowestScore: globalScoreCount > 0 ? minScore : 0,
+      unitStats
     },
-    scoreDistribution: {
-      s100,
-      s90,
-      s80,
-      s70,
-      s60,
-      sUnder60
-    },
-    recentSubmissions,
-    questionStats,
-    entryGateSettings: {
-      enabled: entryGateEnabled,
-      password: entryGatePassword
-    },
-    authSecurityStatus: {
-      isLocked,
-      remainingSec,
-      remainingAttempts: Math.max(0, 3 - failedAttempts)
-    },
+    recentRecords,
     spreadsheetUrl: 'https://dash.cloudflare.com/'
   }
 }
 
 // ============================================================================
-// 核心 RPC 路由器 (與 Index.html 中的 google.script.run 完全相容)
+// RPC API 路由器 (與 Index.html 中的 google.script.run 100% 透明對齊)
 // ============================================================================
 
 app.post('/api/rpc/:method', async (c) => {
@@ -232,270 +217,413 @@ app.post('/api/rpc/:method', async (c) => {
 
   try {
     switch (method) {
-      // 1. 測驗進場通關碼驗證
-      case 'verifyEntryPassword': {
-        const pwd = String(args[0] || '').trim()
-        const enabled = (await getSetting(db, 'ENTRY_GATE_ENABLED', 'true')) === 'true'
-        if (!enabled) {
-          return c.json({ result: { success: true } })
-        }
-        const entryPwd = await getSetting(db, 'ENTRY_PASSWORD', '1234')
-        const adminPwd = await getSetting(db, 'ADMIN_PASSWORD', 'admin')
-        if (pwd === entryPwd || pwd === adminPwd || pwd === '1234' || pwd === 'admin') {
-          return c.json({ result: { success: true } })
-        }
-        return c.json({ result: { success: false, error: '⚠️ 通關密碼不正確，請向任課老師詢問！' } })
+      // 1. 取得公開座號列表
+      case 'getSeatList': {
+        const { results } = await db.prepare(`
+          SELECT seat_no FROM students 
+          WHERE status = '正常' 
+          ORDER BY CAST(seat_no AS INTEGER) ASC, seat_no ASC
+        `).all<{ seat_no: string }>()
+
+        const seats = (results || []).map((s) => {
+          const num = Number(s.seat_no)
+          const label = (!isNaN(num) && num < 10 ? '0' + num : s.seat_no) + ' 號'
+          return { seatNo: s.seat_no, label }
+        })
+        return c.json({ result: { success: true, seats } })
       }
 
-      // 2. 更新進場門禁設定
-      case 'updateEntryGateSettings': {
-        const enabled = Boolean(args[0])
-        const newPassword = String(args[1] || '1234').trim()
-        await setSetting(db, 'ENTRY_GATE_ENABLED', enabled ? 'true' : 'false')
-        if (newPassword) {
-          await setSetting(db, 'ENTRY_PASSWORD', newPassword)
+      // 2. 學生登入驗證
+      case 'studentLogin': {
+        const seatNo = String(args[0] || '').replace(/\.0$/, '').trim()
+        const password = String(args[1] || '').replace(/\.0$/, '').trim()
+
+        if (!seatNo) {
+          return c.json({ result: { success: false, message: '請選擇或輸入您的座號！' } })
         }
-        return c.json({ result: { success: true, message: '進場通關設定已成功更新！' } })
+        if (!password) {
+          return c.json({ result: { success: false, message: '請輸入您的個人密碼！' } })
+        }
+
+        const student = await db.prepare(`
+          SELECT * FROM students 
+          WHERE seat_no = ? OR CAST(seat_no AS INTEGER) = CAST(? AS INTEGER)
+          LIMIT 1
+        `).bind(seatNo, seatNo).first<StudentRow>()
+
+        if (!student) {
+          return c.json({ result: { success: false, message: '查無此座號學生，請向任課老師確認！' } })
+        }
+
+        const studentPwd = String(student.password || '').replace(/\.0$/, '').trim()
+        if (studentPwd !== password) {
+          return c.json({ result: { success: false, message: '個人登入密碼不正確，請重新確認！' } })
+        }
+
+        // 讀取目前開放填寫的單元
+        const { results: unitsRes } = await db.prepare(`
+          SELECT * FROM units 
+          WHERE is_open = 1 
+          ORDER BY created_at ASC
+        `).all<UnitRow>()
+        const openUnits = (unitsRes || []).map((u) => ({
+          unitId: u.unit_id,
+          subject: u.subject,
+          unitName: u.unit_name,
+          maxScore: u.max_score,
+          isOpen: true,
+          createdAt: u.created_at
+        }))
+
+        // 讀取該學生已填報的成績紀錄
+        const { results: scoresRes } = await db.prepare(`
+          SELECT * FROM scores 
+          WHERE class_id = ? AND seat_no = ?
+        `).bind(student.class_id, student.seat_no).all<ScoreRow>()
+
+        const submittedScores: Record<string, { score: number; time: string; note: string }> = {}
+        ;(scoresRes || []).forEach((r) => {
+          submittedScores[r.unit_id] = {
+            score: r.score,
+            time: String(r.submitted_at || ''),
+            note: String(r.note || '')
+          }
+        })
+
+        return c.json({
+          result: {
+            success: true,
+            student: {
+              classId: student.class_id,
+              seatNo: student.seat_no,
+              name: student.name
+            },
+            openUnits,
+            submittedScores
+          }
+        })
       }
 
-      // 3. 取得進場門禁設定
-      case 'getEntryGateSettings': {
-        const enabled = (await getSetting(db, 'ENTRY_GATE_ENABLED', 'true')) === 'true'
-        const password = await getSetting(db, 'ENTRY_PASSWORD', '1234')
-        return c.json({ result: { enabled, password } })
-      }
+      // 3. 學生儲存／填報成績
+      case 'saveStudentScores': {
+        const classId = String(args[0] || '402').trim()
+        const seatNo = String(args[1] || '').trim()
+        const name = String(args[2] || '').trim()
+        const scoreRecords = Array.isArray(args[3]) ? args[3] : []
 
-      // 4. 記錄學生測驗結果 (寫入 Cloudflare D1)
-      case 'recordTestResult': {
-        const payload = args[0] || {}
-        let sSeat = String(payload.studentSeat || '').replace(/\.0$/, '').trim()
-        if (sSeat.length === 1) sSeat = '0' + sSeat
+        if (!seatNo || scoreRecords.length === 0) {
+          return c.json({ result: { success: false, message: '填報參數不完整！' } })
+        }
 
         const nowTaipei = new Date(Date.now() + 8 * 3600 * 1000)
           .toISOString()
           .replace('T', ' ')
           .substring(0, 19)
 
-        const res = await db.prepare(`
-          INSERT INTO quiz_records (
-            timestamp, student_class, seat_number, student_name, unit_mode,
-            score, correct_count, total_questions, accuracy, time_spent,
-            error_categories, wrong_questions, detail_logs, dim_stats_json
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        `).bind(
-          nowTaipei,
-          String(payload.studentClass || '402').trim(),
-          sSeat,
-          String(payload.studentName || '').trim(),
-          String(payload.unitMode || '全單元綜合').trim(),
-          Number(payload.score) || 0,
-          Number(payload.correctCount) || 0,
-          Number(payload.totalQuestions) || 20,
-          Number(payload.accuracy) || 0,
-          Number(payload.timeSpent) || 0,
-          String(payload.errorCategories || ''),
-          String(payload.wrongQuestions || ''),
-          typeof payload.detailLogs === 'object' ? JSON.stringify(payload.detailLogs) : String(payload.detailLogs || '[]'),
-          typeof payload.dimStats === 'object' ? JSON.stringify(payload.dimStats) : '{}'
-        ).run()
+        const statements = []
+        for (const item of scoreRecords) {
+          const uId = String(item.unitId || '').trim()
+          const scoreVal = Number(item.score)
+          if (!uId || isNaN(scoreVal)) continue
+
+          const unitInfo = await db.prepare('SELECT subject, unit_name FROM units WHERE unit_id = ?')
+            .bind(uId).first<{ subject: string; unit_name: string }>()
+
+          const subject = unitInfo ? unitInfo.subject : '一般'
+          const unitName = unitInfo ? unitInfo.unit_name : uId
+          const recId = `REC_${Date.now()}_${Math.floor(Math.random() * 1000)}`
+          const note = String(item.note || '學生自填').trim()
+
+          statements.push(
+            db.prepare(`
+              INSERT INTO scores (
+                record_id, submitted_at, class_id, seat_no, student_name,
+                unit_id, subject, unit_name, score, note
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              ON CONFLICT(class_id, seat_no, unit_id) DO UPDATE SET
+                score = excluded.score,
+                note = excluded.note,
+                submitted_at = excluded.submitted_at,
+                student_name = excluded.student_name
+            `).bind(recId, nowTaipei, classId, seatNo, name, uId, subject, unitName, scoreVal, note)
+          )
+        }
+
+        if (statements.length > 0) {
+          await db.batch(statements)
+        }
 
         return c.json({
           result: {
             success: true,
-            message: '測驗成績已成功登錄至 Cloudflare D1 資料庫！',
-            timestamp: nowTaipei,
-            score: payload.score,
-            id: res.meta.last_row_id
+            message: `已成功儲存 ${statements.length} 筆成績！`,
+            count: statements.length
           }
         })
       }
 
-      // 5. 取得教師後台儀表板完整數據
-      case 'getTeacherDashboardData': {
-        const data = await computeDashboardData(db)
-        return c.json({ result: data })
+      // 4. 教師管理後台登入
+      case 'teacherLogin': {
+        const password = String(args[0] || '').trim()
+        const currentPass = await getSetting(db, 'TEACHER_PASSWORD', 'admin')
+
+        if (password === currentPass) {
+          return c.json({ result: { success: true, message: '管理身分驗證成功' } })
+        }
+        return c.json({ result: { success: false, message: '管理密碼不正確！' } })
       }
 
-      // 6. 教師安全密碼驗證 (含階梯鎖定防護與秒級穿透)
-      case 'verifyTeacherPassword': {
-        const pwd = String(args[0] || '').trim()
-        const adminPwd = await getSetting(db, 'ADMIN_PASSWORD', 'admin')
+      // 5. 修改教師管理密碼
+      case 'changeTeacherPassword': {
+        const oldPass = String(args[0] || '').trim()
+        const newPass = String(args[1] || '').trim()
+        const currentPass = await getSetting(db, 'TEACHER_PASSWORD', 'admin')
 
-        const failedAttempts = Number(await getSetting(db, 'AUTH_FAILED_ATTEMPTS', '0')) || 0
-        const lockUntil = Number(await getSetting(db, 'AUTH_LOCK_UNTIL', '0')) || 0
-        const now = Date.now()
-
-        // 正確密碼秒級穿透：真主人輸入正確密碼立即開門，並清空錯誤計數
-        if (pwd === adminPwd) {
-          await setSetting(db, 'AUTH_FAILED_ATTEMPTS', '0')
-          await setSetting(db, 'AUTH_LOCK_UNTIL', '0')
-          return c.json({ result: { success: true } })
+        if (oldPass !== currentPass) {
+          return c.json({ result: { success: false, message: '原密碼不正確！' } })
+        }
+        if (!newPass || newPass.length < 3) {
+          return c.json({ result: { success: false, message: '新密碼長度至少需 3 碼！' } })
         }
 
-        // 檢查是否處於鎖定狀態
-        if (lockUntil > now) {
-          const remSec = Math.ceil((lockUntil - now) / 1000)
-          return c.json({
-            result: {
-              success: false,
-              locked: true,
-              remainingSec: remSec,
-              remainingAttempts: 0
-            }
-          })
-        }
-
-        // 密碼錯誤：累計錯誤次數
-        const newAttempts = failedAttempts + 1
-        await setSetting(db, 'AUTH_FAILED_ATTEMPTS', String(newAttempts))
-
-        if (newAttempts >= 5) {
-          // 連續錯誤 5 次：深度鎖定 300 秒 (5 分鐘)
-          const newLock = Date.now() + 300 * 1000
-          await setSetting(db, 'AUTH_LOCK_UNTIL', String(newLock))
-          return c.json({
-            result: {
-              success: false,
-              locked: true,
-              remainingSec: 300,
-              remainingAttempts: 0
-            }
-          })
-        } else if (newAttempts >= 3) {
-          // 連續錯誤 3 次：鎖定 60 秒 (1 分鐘)
-          const newLock = Date.now() + 60 * 1000
-          await setSetting(db, 'AUTH_LOCK_UNTIL', String(newLock))
-          return c.json({
-            result: {
-              success: false,
-              locked: true,
-              remainingSec: 60,
-              remainingAttempts: 0
-            }
-          })
-        }
-
-        return c.json({
-          result: {
-            success: false,
-            locked: false,
-            remainingAttempts: Math.max(0, 3 - newAttempts)
-          }
-        })
-      }
-
-      // 7. 取得後台安全狀態
-      case 'getAuthSecurityStatus': {
-        const lockUntil = Number(await getSetting(db, 'AUTH_LOCK_UNTIL', '0')) || 0
-        const now = Date.now()
-        const isLocked = lockUntil > now
-        return c.json({
-          result: {
-            isLocked,
-            remainingSec: isLocked ? Math.ceil((lockUntil - now) / 1000) : 0
-          }
-        })
-      }
-
-      // 8. 重置後台安全鎖定
-      case 'resetAuthLock': {
-        await setSetting(db, 'AUTH_FAILED_ATTEMPTS', '0')
-        await setSetting(db, 'AUTH_LOCK_UNTIL', '0')
-        return c.json({ result: { success: true, message: '安全鎖定防護已重置為正常狀態！' } })
-      }
-
-      // 9. 更新管理密碼
-      case 'updateTeacherPassword': {
-        const oldPwd = String(args[0] || '').trim()
-        const newPwd = String(args[1] || '').trim()
-        const currentPwd = await getSetting(db, 'ADMIN_PASSWORD', 'admin')
-
-        if (oldPwd !== currentPwd) {
-          return c.json({ result: { success: false, error: '原管理密碼不正確！' } })
-        }
-        if (!newPwd || newPwd.length < 3) {
-          return c.json({ result: { success: false, error: '新密碼長度至少需 3 碼！' } })
-        }
-
-        await setSetting(db, 'ADMIN_PASSWORD', newPwd)
+        await setSetting(db, 'TEACHER_PASSWORD', newPass)
         return c.json({ result: { success: true, message: '管理密碼已成功更新！' } })
       }
 
-      // 10. 刪除單筆學生測驗成績
-      case 'deleteTestResult': {
-        const recordId = Number(args[0])
-        if (!recordId) return c.json({ result: { success: false, error: '無效的記錄 ID' } })
-
-        await db.prepare('DELETE FROM quiz_records WHERE id = ?').bind(recordId).run()
-        return c.json({ result: { success: true, message: '已成功自 D1 刪除該筆學生測驗成績！' } })
+      // 6. 取得教師後台儀表板完整數據
+      case 'getTeacherDashboardData': {
+        const data = await computeTeacherDashboard(db)
+        return c.json({ result: data })
       }
 
-      // 11. 批次刪除學生測驗成績
-      case 'deleteBatchTestResults': {
-        const rawIds = args[0]
-        const ids = Array.isArray(rawIds) ? rawIds.map(Number).filter((n) => !isNaN(n) && n > 0) : []
-        if (ids.length === 0) {
-          return c.json({ result: { success: false, error: '未指定要刪除的成績列' } })
+      // 7. 單元管理 (新增、切換開關、編輯、刪除)
+      case 'manageUnit': {
+        const action = String(args[0] || '')
+        const unitData = args[1] || {}
+
+        if (action === 'add') {
+          const uId = String(unitData.unitId || `unit_${Date.now()}`).trim()
+          const subject = String(unitData.subject || '一般').trim()
+          const unitName = String(unitData.unitName || '').trim()
+          const maxScore = Number(unitData.maxScore) || 100
+          const isOpen = unitData.isOpen ? 1 : 0
+
+          if (!unitName) return c.json({ result: { success: false, message: '單元名稱為必填項目！' } })
+
+          await db.prepare(`
+            INSERT INTO units (unit_id, subject, unit_name, max_score, is_open)
+            VALUES (?, ?, ?, ?, ?)
+          `).bind(uId, subject, unitName, maxScore, isOpen).run()
+
+          return c.json({ result: { success: true, message: `已成功新增評量單元「${unitName}」！` } })
+        } else if (action === 'toggle') {
+          const uId = String(unitData.unitId || '').trim()
+          const isOpen = unitData.isOpen ? 1 : 0
+
+          await db.prepare('UPDATE units SET is_open = ? WHERE unit_id = ?')
+            .bind(isOpen, uId).run()
+
+          return c.json({ result: { success: true, message: `單元開放狀態已更新為：${isOpen ? '開放填寫' : '已關閉'}！` } })
+        } else if (action === 'update') {
+          const uId = String(unitData.unitId || '').trim()
+          const subject = String(unitData.subject || '一般').trim()
+          const unitName = String(unitData.unitName || '').trim()
+          const maxScore = Number(unitData.maxScore) || 100
+          const isOpen = unitData.isOpen ? 1 : 0
+
+          if (!unitName) return c.json({ result: { success: false, message: '單元名稱不可為空白！' } })
+
+          await db.prepare(`
+            UPDATE units SET subject = ?, unit_name = ?, max_score = ?, is_open = ?
+            WHERE unit_id = ?
+          `).bind(subject, unitName, maxScore, isOpen, uId).run()
+
+          // 同步更新成績表中該單元名稱
+          await db.prepare('UPDATE scores SET subject = ?, unit_name = ? WHERE unit_id = ?')
+            .bind(subject, unitName, uId).run()
+
+          return c.json({ result: { success: true, message: '單元設定已成功更新！' } })
+        } else if (action === 'delete') {
+          const uId = String(unitData.unitId || '').trim()
+          await db.prepare('DELETE FROM units WHERE unit_id = ?').bind(uId).run()
+          await db.prepare('DELETE FROM scores WHERE unit_id = ?').bind(uId).run()
+          return c.json({ result: { success: true, message: '已成功刪除該評量單元與相關成績記錄！' } })
         }
 
-        const placeholders = ids.map(() => '?').join(',')
-        await db.prepare(`DELETE FROM quiz_records WHERE id IN (${placeholders})`).bind(...ids).run()
-        return c.json({ result: { success: true, count: ids.length, message: `已成功批次刪除 ${ids.length} 筆成績！` } })
+        return c.json({ result: { success: false, message: '未知的單元管理操作！' } })
       }
 
-      // 12. AI 班級學情診斷報告 (100% 繁體中文保證)
-      case 'generateClassAiReport': {
-        const payload = args[0] || {}
-        const kpi = payload.kpi || {}
-        const totalStu = kpi.totalStudents || 0
-        const avg = kpi.avgScore || 0
-        const passRt = kpi.passRate || 0
+      // 8. 批次匯入學生名冊
+      case 'batchImportStudents': {
+        const rawText = String(args[0] || '').trim()
+        const defaultClass = String(args[1] || '402').trim()
+        const defaultPwdType = String(args[2] || 'seat').trim()
 
-        const report = `【四年級數學 第二單元「整數乘法直式計算」全班學情診斷分析報告】
+        if (!rawText) return c.json({ result: { success: false, message: '請提供要匯入的名冊內容！' } })
 
-一、📊 全班整體學情與認知維度掌握總評：
-本次測驗全班共有 ${totalStu} 位學生完成作答，平均得分為 ${avg} 分，及格率達到 ${passRt}%。
-在四大認知維度中，同學在「四位數乘一位數」的運算技能掌握度較高，但在「二位數乘二位數的分步積對齊」與「連續進位之加法整合」上展現出顯著的層次落差。
+        const lines = rawText.split(/\r?\n/)
+        let count = 0
+        const statements = []
 
-二、🔍 前三大關鍵迷思與位值計算卡點深層剖析：
-1. 乘數十位乘積錯位（對齊卡點）：當乘數為二位數時，第二層部分積代表「幾個十」，部分學生仍直覺從個位起寫，導致加總時整體位值偏移一格。
-2. 被乘數中間有0的進位忽略：例如 3085 × 6，十位向百位進位時，學生容易在 0×6=0 後忘記加上進位的數字，直接寫 0。
-3. 雙重進位時的加法混淆：在第二層十位積與第一層個位積加總時，部分學生將直式乘法的進位記號與最後加法的進位記號混淆，導致答案相差 10 或 100。
+        for (const line of lines) {
+          const parts = line.split(/[,\t ]+/).map((p) => p.trim()).filter(Boolean)
+          if (parts.length < 2) continue
 
-三、🛠️ 課堂教學策略與電子白板互動補救引導：
-1. 善用課堂投影教學舞台：利用分色列展示個位積（黃色區塊）與十位積（藍色區塊），強調「十位退一格」的位值物理意義。
-2. 整十數乘法速算口訣帶讀：「整十乘法個位補一零，十位數字直接乘被乘數，兩步驟清晰不混淆」。
-3. 實施動態引導提問：針對二位數乘法，先請學生估算「大約是幾千」，再進行直式精確計算，培養數學數感。
+          const seatNo = parts[0].replace(/\.0$/, '')
+          const name = parts[1]
+          let pwd = parts[2] ? parts[2].replace(/\.0$/, '') : ''
 
-四、📝 差異化課後個別練習單推動建議：
-針對本次測驗答錯題目之學生，可立即利用系統【一鍵批次列印全班錯題學習單】，每人精準發放 1～3 道專屬訂正題，結合右側等大定位板與「舉一反三平行變式題」，落實手寫訂正與家長簽章追蹤。`
+          if (!pwd) {
+            if (defaultPwdType === 'seat') pwd = seatNo
+            else if (defaultPwdType === 'class_seat') pwd = defaultClass + seatNo
+            else pwd = seatNo
+          }
 
-        // 歸檔報告至 D1
-        await db.prepare('INSERT INTO ai_reports (report_text) VALUES (?)').bind(report).run()
+          statements.push(
+            db.prepare(`
+              INSERT INTO students (class_id, seat_no, name, password, status)
+              VALUES (?, ?, ?, ?, '正常')
+              ON CONFLICT(class_id, seat_no) DO UPDATE SET
+                name = excluded.name,
+                password = excluded.password,
+                status = '正常',
+                updated_at = CURRENT_TIMESTAMP
+            `).bind(defaultClass, seatNo, name, pwd)
+          )
+          count++
+        }
 
-        return c.json({ result: { success: true, report } })
+        if (statements.length > 0) {
+          await db.batch(statements)
+        }
+
+        return c.json({ result: { success: true, count, message: `已成功匯入／更新 ${count} 位學生資料！` } })
       }
 
-      // 13. AI 家教個別化解題 (100% 繁體中文保證)
-      case 'askAiTutor': {
-        const qData = args[0] || {}
-        const stuAns = args[1] || ''
-        const title = qData.title || ''
-        const expl = qData.stepExplanation || qData.explanation || ''
+      // 9. 批次刪除學生
+      case 'batchDeleteStudents': {
+        const studentList = Array.isArray(args[0]) ? args[0] : []
+        if (studentList.length === 0) {
+          return c.json({ result: { success: false, message: '未指定要刪除的學生清單！' } })
+        }
 
-        const guidance = `【🤖 AI 老師溫馨解題引導】：
+        const statements = []
+        for (const stu of studentList) {
+          const cId = String(stu.classId || '402').trim()
+          const sNo = String(stu.seatNo || '').trim()
+          statements.push(db.prepare('DELETE FROM students WHERE class_id = ? AND seat_no = ?').bind(cId, sNo))
+          statements.push(db.prepare('DELETE FROM scores WHERE class_id = ? AND seat_no = ?').bind(cId, sNo))
+        }
 
-親愛的同學，我們一起來看看這道題目：
-📌 ${title}
+        await db.batch(statements)
+        return c.json({ result: { success: true, count: studentList.length, message: `已成功批次刪除 ${studentList.length} 位學生！` } })
+      }
 
-💡 關鍵步驟提示：
-${expl}
+      // 10. 批次修改密碼
+      case 'batchUpdateStudentPasswords': {
+        const studentList = Array.isArray(args[0]) ? args[0] : []
+        const pwdType = String(args[1] || 'seat').trim()
+        const customPwd = String(args[2] || '').trim()
 
-🎯 記憶小技巧：
-1. 算一位數乘法時，從個位開始慢慢向左乘，記得有進位要在上方寫上小小的記號。
-2. 算二位數乘法時，先算個位乘積，換十位相乘時「末尾先補一個0」或「退一格對齊十位」，最後兩行相加就是正確答案囉！加油，再算一次一定會算對！`
+        if (studentList.length === 0) {
+          return c.json({ result: { success: false, message: '未指定要修改密碼的學生清單！' } })
+        }
 
-        return c.json({ result: guidance })
+        const statements = []
+        for (const stu of studentList) {
+          const cId = String(stu.classId || '402').trim()
+          const sNo = String(stu.seatNo || '').trim()
+          let newPwd = sNo
+          if (pwdType === 'class_seat') newPwd = cId + sNo
+          else if (pwdType === 'custom') newPwd = customPwd || sNo
+
+          statements.push(
+            db.prepare('UPDATE students SET password = ?, updated_at = CURRENT_TIMESTAMP WHERE class_id = ? AND seat_no = ?')
+              .bind(newPwd, cId, sNo)
+          )
+        }
+
+        await db.batch(statements)
+        return c.json({ result: { success: true, count: studentList.length, message: `已成功更新 ${studentList.length} 位學生的密碼！` } })
+      }
+
+      // 11. 刪除單一學生
+      case 'deleteStudentRecord': {
+        const classId = String(args[0] || '402').trim()
+        const seatNo = String(args[1] || '').trim()
+        await db.prepare('DELETE FROM students WHERE class_id = ? AND seat_no = ?').bind(classId, seatNo).run()
+        await db.prepare('DELETE FROM scores WHERE class_id = ? AND seat_no = ?').bind(classId, seatNo).run()
+        return c.json({ result: { success: true, message: '已刪除該學生資料！' } })
+      }
+
+      // 12. 編輯單一學生資料
+      case 'editSingleStudent': {
+        const oldClassId = String(args[0] || '402').trim()
+        const oldSeatNo = String(args[1] || '').trim()
+        const newClassId = String(args[2] || oldClassId).trim()
+        const newSeatNo = String(args[3] || oldSeatNo).trim()
+        const newName = String(args[4] || '').trim()
+        const newPassword = String(args[5] || '').trim()
+
+        if (!newName || !newSeatNo) {
+          return c.json({ result: { success: false, message: '座號與姓名為必填！' } })
+        }
+
+        await db.prepare(`
+          UPDATE students SET class_id = ?, seat_no = ?, name = ?, password = ?, updated_at = CURRENT_TIMESTAMP
+          WHERE class_id = ? AND seat_no = ?
+        `).bind(newClassId, newSeatNo, newName, newPassword, oldClassId, oldSeatNo).run()
+
+        // 同步更新成績記錄
+        await db.prepare(`
+          UPDATE scores SET class_id = ?, seat_no = ?, student_name = ?
+          WHERE class_id = ? AND seat_no = ?
+        `).bind(newClassId, newSeatNo, newName, oldClassId, oldSeatNo).run()
+
+        return c.json({ result: { success: true, message: '學生資料修改成功！' } })
+      }
+
+      // 13. 教師手動修改學生成績
+      case 'updateStudentScoreByTeacher': {
+        const classId = String(args[0] || '402').trim()
+        const seatNo = String(args[1] || '').trim()
+        const name = String(args[2] || '').trim()
+        const unitId = String(args[3] || '').trim()
+        const scoreVal = Number(args[4])
+        const note = String(args[5] || '教師手動登記').trim()
+
+        if (isNaN(scoreVal)) {
+          return c.json({ result: { success: false, message: '請輸入有效的分數數值！' } })
+        }
+
+        const unitInfo = await db.prepare('SELECT subject, unit_name FROM units WHERE unit_id = ?')
+          .bind(unitId).first<{ subject: string; unit_name: string }>()
+
+        const subject = unitInfo ? unitInfo.subject : '一般'
+        const unitName = unitInfo ? unitInfo.unit_name : unitId
+        const recId = `REC_${Date.now()}_${Math.floor(Math.random() * 1000)}`
+        const nowTaipei = new Date(Date.now() + 8 * 3600 * 1000)
+          .toISOString()
+          .replace('T', ' ')
+          .substring(0, 19)
+
+        await db.prepare(`
+          INSERT INTO scores (
+            record_id, submitted_at, class_id, seat_no, student_name,
+            unit_id, subject, unit_name, score, note
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ON CONFLICT(class_id, seat_no, unit_id) DO UPDATE SET
+            score = excluded.score,
+            note = excluded.note,
+            submitted_at = excluded.submitted_at,
+            student_name = excluded.student_name
+        `).bind(recId, nowTaipei, classId, seatNo, name, unitId, subject, unitName, scoreVal, note).run()
+
+        return c.json({ result: { success: true, message: '學生成績已成功更新！' } })
+      }
+
+      case 'getSpreadsheetUrl': {
+        return c.json({ result: 'https://dash.cloudflare.com/' })
       }
 
       default:
@@ -508,60 +636,63 @@ ${expl}
 })
 
 // ============================================================================
-// RESTful API 路由 (支援外部整合與數據報表)
+// RESTful 報表端點
 // ============================================================================
 
-// 1. 取得全班成績列表與 KPI
 app.get('/api/scores', async (c) => {
-  const data = await computeDashboardData(c.env.DB)
-  return c.json({ success: true, ...data })
+  const data = await computeTeacherDashboard(c.env.DB)
+  return c.json(data)
 })
 
-// 2. 匯出成績 CSV 檔案 (UTF-8 with BOM，Excel 繁中不亂碼)
 app.get('/api/export/csv', async (c) => {
-  const { results } = await c.env.DB.prepare(`
-    SELECT * FROM quiz_records 
-    ORDER BY CAST(seat_number AS INTEGER) ASC, timestamp DESC
-  `).all<QuizRecordRow>()
+  const data = await computeTeacherDashboard(c.env.DB)
+  const students = data.students || []
+  const units = data.units || []
+  const matrix = data.scoreMatrix || {}
 
-  const rows = results || []
-  let csv = '\uFEFF記錄編號,交卷時間,班級,座號,姓名,評量模式,總得分,答對題數,總題數,正確率(%),測驗耗時(秒),錯誤題號,備註\n'
+  let csv = '\uFEFF班級,座號,姓名'
+  units.forEach((u: any) => {
+    csv += `,"${u.subject} - ${u.unitName}"`
+  })
+  csv += ',填報項目數,個人總平均\n'
 
-  const esc = (s: any) => `"${String(s || '').replace(/"/g, '""')}"`
-
-  rows.forEach((r) => {
-    csv += `${r.id},${esc(r.timestamp)},${esc(r.student_class)},${esc(r.seat_number)},${esc(r.student_name)},${esc(r.unit_mode)},${r.score},${r.correct_count},${r.total_questions},${r.accuracy},${r.time_spent},${esc(r.wrong_questions)},${esc(r.error_categories)}\n`
+  students.forEach((stu: any) => {
+    const key = `${stu.classId}_${stu.seatNo}`
+    const item = matrix[key] || { scores: {}, submittedCount: 0, averageScore: 0 }
+    csv += `"${stu.classId}","${stu.seatNo}","${stu.name}"`
+    units.forEach((u: any) => {
+      const s = item.scores[u.unitId]
+      csv += `,${s ? s.score : ''}`
+    })
+    csv += `,${item.submittedCount},${item.averageScore}\n`
   })
 
   c.header('Content-Type', 'text/csv; charset=utf-8')
-  c.header('Content-Disposition', 'attachment; filename="四年級數學_整數乘法直式測驗_全班成績總表.csv"')
+  c.header('Content-Disposition', 'attachment; filename="402班_學生成績總矩陣表.csv"')
   return c.body(csv)
 })
 
-// 3. 健康檢查與版本端點
 app.get('/api/health', (c) => {
   return c.json({
     status: 'ok',
-    version: 'v27.0-cloudflare-d1',
-    platform: 'Cloudflare Workers + D1 Database',
+    app: 'student-score-platform',
+    version: 'v1.0.0-cloudflare-d1',
     timestamp: new Date().toISOString()
   })
 })
 
 // ============================================================================
-// 前端頁面 SSR 渲染 (注入初始數據，0.001 秒極速秒開)
+// SSR 渲染首頁 (注入預載資料，0.001 秒首頁秒開)
 // ============================================================================
 
 app.get('/', async (c) => {
   try {
-    const dashData = await computeDashboardData(c.env.DB)
+    const dashData = await computeTeacherDashboard(c.env.DB)
     const initialJson = JSON.stringify(dashData)
-    // 注入初始數據至 HTML 模板
     const html = BASE_INDEX_HTML.replace('/*__SERVER_DATA__*/ null', initialJson)
     return c.html(html)
   } catch (err: any) {
     console.error('SSR Error:', err)
-    // 降級輸出基礎 HTML
     return c.html(BASE_INDEX_HTML)
   }
 })

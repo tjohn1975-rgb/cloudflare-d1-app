@@ -1,13 +1,13 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "math-4a-vertical-mult",
+  "name": "student-score-platform",
   "main": "src/index.ts",
   "compatibility_date": "2025-03-01",
   "d1_databases": [
     {
       "binding": "DB",
-      "database_name": "math-4a-vertical-mult-db",
-      "database_id": "a9562547-5374-457e-92c1-18ba8e11294b"
+      "database_name": "student-score-platform-db",
+      "database_id": "322beec7-c217-4d17-b466-72d380d25602"
     }
   ]
 }
