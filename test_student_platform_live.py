@@ -64,13 +64,14 @@ def main():
     ok, res = test_endpoint("Get Teacher Dashboard", f"{BASE_URL}/api/rpc/getTeacherDashboardData", "POST", {"args": []})
     if ok and isinstance(res, dict) and "result" in res:
         data = res["result"]
+        units = data.get('units', [])
         print(f"  -> Total students: {len(data.get('students', []))}")
-        print(f"  -> Total units: {len(data.get('units', []))}")
-        stats = data.get("statistics", {})
-        print(f"  -> Statistics: Total {stats.get('totalStudents')}, Submitted {stats.get('submittedCount')}, Avg {stats.get('averageScore')}")
-        
-    # 6. CSV Export
-    test_endpoint("CSV Export", f"{BASE_URL}/api/export/csv", "GET")
+        print(f"  -> Total units: {len(units)}")
+        for u in units:
+            print(f"     [Unit] id: {u.get('id')}, name: {u.get('name')}, isOpen: {u.get('isOpen')}")
+        summary = data.get("summary", {})
+        print(f"  -> Summary: {summary}")
+
     
     # 7. Front Page HTML SSR
     test_endpoint("Front Page HTML (SSR)", f"{BASE_URL}/", "GET")

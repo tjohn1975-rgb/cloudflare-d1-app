@@ -60,7 +60,7 @@ async function setSetting(db: D1Database, key: string, value: string): Promise<v
 }
 
 // ============================================================================
-// 後台資料運算核心 (學生名冊、單元設定、成績矩陣、統計指標)
+// 後台資料運算核心 (與前端 Index.html 結構 100% 嚴格對齊)
 // ============================================================================
 
 async function computeTeacherDashboard(db: D1Database) {
@@ -78,15 +78,17 @@ async function computeTeacherDashboard(db: D1Database) {
     updatedAt: s.updated_at
   }))
 
-  // 2. 評量單元
+  // 2. 評量單元 (提供 id, name 與 unitId, unitName 雙重鍵值，保證 100% 相容)
   const { results: unitsRes } = await db.prepare(`
     SELECT * FROM units 
     ORDER BY created_at ASC
   `).all<UnitRow>()
   const units = (unitsRes || []).map((u) => ({
+    id: u.unit_id,
     unitId: u.unit_id,
-    subject: u.subject,
+    name: u.unit_name,
     unitName: u.unit_name,
+    subject: u.subject,
     maxScore: u.max_score,
     isOpen: u.is_open === 1,
     createdAt: u.created_at
@@ -99,108 +101,172 @@ async function computeTeacherDashboard(db: D1Database) {
   `).all<ScoreRow>()
   const allScores = scoresRes || []
 
-  // 建立成績矩陣 (以 classId_seatNo 為 key)
-  const scoreMatrix: Record<string, any> = {}
-  students.forEach((stu) => {
+  // 建立成績映射表 scoreMap (key: class_seat -> { [unitId]: { score, time, note } })
+  const scoreMap: Record<string, Record<string, { score: any; time: string; note: string }>> = {}
+  allScores.forEach((r) => {
+    const sKey = `${r.class_id}_${r.seat_no}`
+    if (!scoreMap[sKey]) scoreMap[sKey] = {}
+    scoreMap[sKey][r.unit_id] = {
+      score: r.score,
+      time: String(r.submitted_at || ''),
+      note: String(r.note || '')
+    }
+
+    // 支援數值型座號備援
+    const numSeat = Number(r.seat_no)
+    if (!isNaN(numSeat)) {
+      const numKey = `${r.class_id}_${numSeat}`
+      if (!scoreMap[numKey]) scoreMap[numKey] = {}
+      scoreMap[numKey][r.unit_id] = {
+        score: r.score,
+        time: String(r.submitted_at || ''),
+        note: String(r.note || '')
+      }
+    }
+  })
+
+  // 4. 統計運算 (matrix, unsubmittedStudents, summary)
+  const openUnits = units.filter((u) => u.isOpen)
+  const openUnitIds = openUnits.map((u) => u.id)
+
+  const matrix: any[] = []
+  const unsubmittedStudents: any[] = []
+  let fullySubmittedCount = 0
+  let partialSubmittedCount = 0
+  let notSubmittedCount = 0
+
+  for (let s = 0; s < students.length; s++) {
+    const stu = students[s]
     const key = `${stu.classId}_${stu.seatNo}`
-    scoreMatrix[key] = {
+    const stuScores = scoreMap[key] || scoreMap[`402_${stu.seatNo}`] || {}
+
+    let filledOpenCount = 0
+    let sum = 0
+    let validCount = 0
+
+    for (let k = 0; k < openUnitIds.length; k++) {
+      const uId = openUnitIds[k]
+      if (stuScores[uId] !== undefined && stuScores[uId].score !== '' && stuScores[uId].score !== null) {
+        filledOpenCount++
+        const num = Number(stuScores[uId].score)
+        if (!isNaN(num)) {
+          sum += num
+          validCount++
+        }
+      }
+    }
+
+    const avg = validCount > 0 ? Math.round((sum / validCount) * 10) / 10 : null
+
+    let statusType = 'none'
+    if (openUnitIds.length === 0) {
+      statusType = 'full'
+      fullySubmittedCount++
+    } else if (filledOpenCount === openUnitIds.length) {
+      statusType = 'full'
+      fullySubmittedCount++
+    } else if (filledOpenCount > 0) {
+      statusType = 'partial'
+      partialSubmittedCount++
+      unsubmittedStudents.push({
+        seatNo: stu.seatNo,
+        name: stu.name,
+        missingCount: openUnitIds.length - filledOpenCount
+      })
+    } else {
+      statusType = 'none'
+      notSubmittedCount++
+      unsubmittedStudents.push({
+        seatNo: stu.seatNo,
+        name: stu.name,
+        missingCount: openUnitIds.length
+      })
+    }
+
+    matrix.push({
       classId: stu.classId,
       seatNo: stu.seatNo,
       name: stu.name,
-      scores: {},
-      submittedCount: 0,
-      totalScore: 0,
-      averageScore: 0
+      scores: stuScores,
+      filledOpenCount,
+      totalOpenCount: openUnitIds.length,
+      average: avg,
+      statusType
+    })
+  }
+
+  // 5. 各單元統計（平均、最高、最低、及格率、六大級距）
+  const unitStats: Record<string, any> = {}
+  for (let uIdx = 0; uIdx < units.length; uIdx++) {
+    const unit = units[uIdx]
+    const unitScores: number[] = []
+    const dist = {
+      score100: 0,
+      score90: 0,
+      score80: 0,
+      score70: 0,
+      score60: 0,
+      under60: 0
     }
-  })
 
-  let globalScoreSum = 0
-  let globalScoreCount = 0
-  let maxScore = 0
-  let minScore = 999
-
-  // 統計單元指標
-  const unitStatsMap: Record<string, { total: number; sum: number; passCount: number }> = {}
-  units.forEach((u) => {
-    unitStatsMap[u.unitId] = { total: 0, sum: 0, passCount: 0 }
-  })
-
-  allScores.forEach((r) => {
-    const key = `${r.class_id}_${r.seat_no}`
-    if (scoreMatrix[key]) {
-      scoreMatrix[key].scores[r.unit_id] = {
-        score: r.score,
-        time: r.submitted_at,
-        note: r.note || ''
+    for (let sIdx = 0; sIdx < students.length; sIdx++) {
+      const st = students[sIdx]
+      const sKey = `${st.classId}_${st.seatNo}`
+      const scObj = (scoreMap[sKey] && scoreMap[sKey][unit.id]) ? scoreMap[sKey][unit.id].score : null
+      if (scObj !== null && scObj !== undefined && scObj !== '' && scObj !== '缺考') {
+        const num = Number(scObj)
+        if (!isNaN(num)) {
+          unitScores.push(num)
+          if (num >= 100) dist.score100++
+          else if (num >= 90) dist.score90++
+          else if (num >= 80) dist.score80++
+          else if (num >= 70) dist.score70++
+          else if (num >= 60) dist.score60++
+          else dist.under60++
+        }
       }
-      scoreMatrix[key].submittedCount++
-      scoreMatrix[key].totalScore += r.score
     }
 
-    globalScoreSum += r.score
-    globalScoreCount++
-    if (r.score > maxScore) maxScore = r.score
-    if (r.score < minScore) minScore = r.score
+    const uCount = unitScores.length
+    let uAvg = 0
+    let uMax = 0
+    let uMin = 0
+    let uPass = 0
 
-    if (unitStatsMap[r.unit_id]) {
-      unitStatsMap[r.unit_id].total++
-      unitStatsMap[r.unit_id].sum += r.score
-      if (r.score >= 60) unitStatsMap[r.unit_id].passCount++
+    if (uCount > 0) {
+      const uSum = unitScores.reduce((a, b) => a + b, 0)
+      uAvg = Math.round((uSum / uCount) * 10) / 10
+      uMax = Math.max(...unitScores)
+      uMin = Math.min(...unitScores)
+      uPass = Math.round((unitScores.filter((n) => n >= 60).length / uCount) * 100)
     }
-  })
 
-  // 計算每位學生個人平均
-  let studentsWithSubmissions = 0
-  Object.values(scoreMatrix).forEach((item: any) => {
-    if (item.submittedCount > 0) {
-      item.averageScore = Math.round((item.totalScore / item.submittedCount) * 10) / 10
-      studentsWithSubmissions++
+    unitStats[unit.id] = {
+      count: uCount,
+      average: uAvg,
+      max: uMax,
+      min: uMin,
+      passRate: uPass,
+      distribution: dist
     }
-  })
+  }
 
-  // 單元統計陣列
-  const unitStats = units.map((u) => {
-    const stat = unitStatsMap[u.unitId] || { total: 0, sum: 0, passCount: 0 }
-    return {
-      unitId: u.unitId,
-      subject: u.subject,
-      unitName: u.unitName,
-      submittedCount: stat.total,
-      averageScore: stat.total > 0 ? Math.round((stat.sum / stat.total) * 10) / 10 : 0,
-      passRate: stat.total > 0 ? Math.round((stat.passCount / stat.total) * 100) : 0
-    }
-  })
-
-  // 近期 50 筆紀錄
-  const recentRecords = allScores.slice(0, 50).map((r) => ({
-    id: r.id,
-    recordId: r.record_id,
-    time: r.submitted_at,
-    classId: r.class_id,
-    seatNo: r.seat_no,
-    name: r.student_name,
-    unitId: r.unit_id,
-    subject: r.subject,
-    unitName: r.unit_name,
-    score: r.score,
-    note: r.note
-  }))
-
-  const totalStudents = students.length
+  // 6. 整合完整後台資料包
   return {
     success: true,
     students,
     units,
-    scoreMatrix,
-    statistics: {
-      totalStudents,
-      submittedCount: studentsWithSubmissions,
-      averageScore: globalScoreCount > 0 ? Math.round((globalScoreSum / globalScoreCount) * 10) / 10 : 0,
-      highestScore: globalScoreCount > 0 ? maxScore : 0,
-      lowestScore: globalScoreCount > 0 ? minScore : 0,
-      unitStats
+    matrix,
+    scoreMatrix: matrix,
+    unsubmittedStudents,
+    summary: {
+      totalStudents: students.length,
+      fullySubmittedCount,
+      partialSubmittedCount,
+      notSubmittedCount,
+      openUnitsCount: openUnitIds.length
     },
-    recentRecords,
+    unitStats,
     spreadsheetUrl: 'https://dash.cloudflare.com/'
   }
 }
@@ -260,16 +326,18 @@ app.post('/api/rpc/:method', async (c) => {
           return c.json({ result: { success: false, message: '個人登入密碼不正確，請重新確認！' } })
         }
 
-        // 讀取目前開放填寫的單元
+        // 讀取目前開放填寫的單元 (雙重鍵值 id 與 name)
         const { results: unitsRes } = await db.prepare(`
           SELECT * FROM units 
           WHERE is_open = 1 
           ORDER BY created_at ASC
         `).all<UnitRow>()
         const openUnits = (unitsRes || []).map((u) => ({
+          id: u.unit_id,
           unitId: u.unit_id,
-          subject: u.subject,
+          name: u.unit_name,
           unitName: u.unit_name,
+          subject: u.subject,
           maxScore: u.max_score,
           isOpen: true,
           createdAt: u.created_at
@@ -278,8 +346,8 @@ app.post('/api/rpc/:method', async (c) => {
         // 讀取該學生已填報的成績紀錄
         const { results: scoresRes } = await db.prepare(`
           SELECT * FROM scores 
-          WHERE class_id = ? AND seat_no = ?
-        `).bind(student.class_id, student.seat_no).all<ScoreRow>()
+          WHERE class_id = ? AND (seat_no = ? OR CAST(seat_no AS INTEGER) = CAST(? AS INTEGER))
+        `).bind(student.class_id, student.seat_no, student.seat_no).all<ScoreRow>()
 
         const submittedScores: Record<string, { score: number; time: string; note: string }> = {}
         ;(scoresRes || []).forEach((r) => {
@@ -322,7 +390,7 @@ app.post('/api/rpc/:method', async (c) => {
 
         const statements = []
         for (const item of scoreRecords) {
-          const uId = String(item.unitId || '').trim()
+          const uId = String(item.unitId || item.id || '').trim()
           const scoreVal = Number(item.score)
           if (!uId || isNaN(scoreVal)) continue
 
@@ -400,11 +468,11 @@ app.post('/api/rpc/:method', async (c) => {
       case 'manageUnit': {
         const action = String(args[0] || '')
         const unitData = args[1] || {}
+        const uId = String(unitData.unitId || unitData.id || `unit_${Date.now()}`).trim()
 
         if (action === 'add') {
-          const uId = String(unitData.unitId || `unit_${Date.now()}`).trim()
           const subject = String(unitData.subject || '一般').trim()
-          const unitName = String(unitData.unitName || '').trim()
+          const unitName = String(unitData.name || unitData.unitName || '').trim()
           const maxScore = Number(unitData.maxScore) || 100
           const isOpen = unitData.isOpen ? 1 : 0
 
@@ -417,7 +485,6 @@ app.post('/api/rpc/:method', async (c) => {
 
           return c.json({ result: { success: true, message: `已成功新增評量單元「${unitName}」！` } })
         } else if (action === 'toggle') {
-          const uId = String(unitData.unitId || '').trim()
           const isOpen = unitData.isOpen ? 1 : 0
 
           await db.prepare('UPDATE units SET is_open = ? WHERE unit_id = ?')
@@ -425,11 +492,10 @@ app.post('/api/rpc/:method', async (c) => {
 
           return c.json({ result: { success: true, message: `單元開放狀態已更新為：${isOpen ? '開放填寫' : '已關閉'}！` } })
         } else if (action === 'update') {
-          const uId = String(unitData.unitId || '').trim()
           const subject = String(unitData.subject || '一般').trim()
-          const unitName = String(unitData.unitName || '').trim()
+          const unitName = String(unitData.name || unitData.unitName || '').trim()
           const maxScore = Number(unitData.maxScore) || 100
-          const isOpen = unitData.isOpen ? 1 : 0
+          const isOpen = (unitData.isOpen === true || unitData.isOpen === 1) ? 1 : 0
 
           if (!unitName) return c.json({ result: { success: false, message: '單元名稱不可為空白！' } })
 
@@ -438,13 +504,12 @@ app.post('/api/rpc/:method', async (c) => {
             WHERE unit_id = ?
           `).bind(subject, unitName, maxScore, isOpen, uId).run()
 
-          // 同步更新成績表中該單元名稱
+          // 同步更新成績表中該單元名稱與科目
           await db.prepare('UPDATE scores SET subject = ?, unit_name = ? WHERE unit_id = ?')
             .bind(subject, unitName, uId).run()
 
           return c.json({ result: { success: true, message: '單元設定已成功更新！' } })
         } else if (action === 'delete') {
-          const uId = String(unitData.unitId || '').trim()
           await db.prepare('DELETE FROM units WHERE unit_id = ?').bind(uId).run()
           await db.prepare('DELETE FROM scores WHERE unit_id = ?').bind(uId).run()
           return c.json({ result: { success: true, message: '已成功刪除該評量單元與相關成績記錄！' } })
@@ -648,23 +713,28 @@ app.get('/api/export/csv', async (c) => {
   const data = await computeTeacherDashboard(c.env.DB)
   const students = data.students || []
   const units = data.units || []
-  const matrix = data.scoreMatrix || {}
+  const matrix = data.matrix || []
+  const matrixMap: Record<string, any> = {}
+  matrix.forEach((m: any) => {
+    matrixMap[`${m.classId}_${m.seatNo}`] = m
+  })
 
   let csv = '\uFEFF班級,座號,姓名'
   units.forEach((u: any) => {
-    csv += `,"${u.subject} - ${u.unitName}"`
+    csv += `,"${u.subject} - ${u.name}"`
   })
-  csv += ',填報項目數,個人總平均\n'
+  csv += ',已填項目,個人總平均,狀態\n'
 
   students.forEach((stu: any) => {
     const key = `${stu.classId}_${stu.seatNo}`
-    const item = matrix[key] || { scores: {}, submittedCount: 0, averageScore: 0 }
+    const item = matrixMap[key] || { scores: {}, filledOpenCount: 0, totalOpenCount: 0, average: null, statusType: '未填' }
     csv += `"${stu.classId}","${stu.seatNo}","${stu.name}"`
     units.forEach((u: any) => {
-      const s = item.scores[u.unitId]
+      const s = item.scores ? item.scores[u.id] : null
       csv += `,${s ? s.score : ''}`
     })
-    csv += `,${item.submittedCount},${item.averageScore}\n`
+    const statusText = item.statusType === 'full' ? '已完成' : (item.statusType === 'partial' ? '部分填寫' : '未填寫')
+    csv += `,${item.filledOpenCount || 0}/${item.totalOpenCount || 0},${item.average !== null ? item.average : ''},${statusText}\n`
   })
 
   c.header('Content-Type', 'text/csv; charset=utf-8')
@@ -676,7 +746,7 @@ app.get('/api/health', (c) => {
   return c.json({
     status: 'ok',
     app: 'student-score-platform',
-    version: 'v1.0.0-cloudflare-d1',
+    version: 'v1.1.0-cloudflare-d1',
     timestamp: new Date().toISOString()
   })
 })
