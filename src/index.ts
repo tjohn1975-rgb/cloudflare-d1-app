@@ -60,6 +60,64 @@ async function setSetting(db: D1Database, key: string, value: string): Promise<v
 }
 
 // ============================================================================
+// D1 資料庫直接檢視與全表讀取 (供教師後台檢視與備份)
+// ============================================================================
+
+async function getD1DatabaseData(db: D1Database) {
+  const { results: students } = await db.prepare(`
+    SELECT id, class_id, seat_no, name, password, status, updated_at 
+    FROM students 
+    ORDER BY CAST(seat_no AS INTEGER) ASC, seat_no ASC
+  `).all<StudentRow>()
+
+  const { results: units } = await db.prepare(`
+    SELECT unit_id, subject, unit_name, max_score, is_open, created_at 
+    FROM units 
+    ORDER BY created_at ASC
+  `).all<UnitRow>()
+
+  const { results: scores } = await db.prepare(`
+    SELECT id, record_id, submitted_at, class_id, seat_no, student_name, unit_id, subject, unit_name, score, note 
+    FROM scores 
+    ORDER BY submitted_at DESC, CAST(seat_no AS INTEGER) ASC
+  `).all<ScoreRow>()
+
+  const { results: settings } = await db.prepare(`
+    SELECT key, value 
+    FROM system_settings 
+    ORDER BY key ASC
+  `).all<{ key: string; value: string }>()
+
+  const stuList = students || []
+  const uList = units || []
+  const scList = scores || []
+  const setList = settings || []
+
+  return {
+    success: true,
+    dbInfo: {
+      databaseName: 'student-score-platform-db',
+      databaseId: '322beec7-c217-4d17-b466-72d380d25602',
+      engine: 'Cloudflare D1 (SQLite)・APAC 邊緣節點',
+      counts: {
+        students: stuList.length,
+        units: uList.length,
+        scores: scList.length,
+        settings: setList.length,
+        total: stuList.length + uList.length + scList.length + setList.length
+      },
+      updatedAt: new Date(Date.now() + 8 * 3600 * 1000).toISOString().replace('T', ' ').substring(0, 19)
+    },
+    tables: {
+      students: stuList,
+      units: uList,
+      scores: scList,
+      settings: setList
+    }
+  }
+}
+
+// ============================================================================
 // 後台資料運算核心 (與前端 Index.html 結構 100% 嚴格對齊)
 // ============================================================================
 
@@ -691,6 +749,12 @@ app.post('/api/rpc/:method', async (c) => {
         return c.json({ result: 'https://dash.cloudflare.com/' })
       }
 
+      // 14. 取得 D1 資料庫完整檢視數據
+      case 'getD1DatabaseView': {
+        const d1Data = await getD1DatabaseData(db)
+        return c.json({ result: d1Data })
+      }
+
       default:
         return c.json({ isError: true, error: `未支援的 RPC 方法: ${method}` }, 400)
     }
@@ -701,7 +765,7 @@ app.post('/api/rpc/:method', async (c) => {
 })
 
 // ============================================================================
-// RESTful 報表端點
+// RESTful 報表與資料下載端點
 // ============================================================================
 
 app.get('/api/scores', async (c) => {
@@ -709,8 +773,85 @@ app.get('/api/scores', async (c) => {
   return c.json(data)
 })
 
+// D1 資料庫即時檢視 API (支援全表或指定單表)
+app.get('/api/database/view', async (c) => {
+  const d1Data = await getD1DatabaseData(c.env.DB)
+  return c.json(d1Data)
+})
+
+// D1 完整資料庫備份下載 API (JSON 格式)
+app.get('/api/export/json', async (c) => {
+  const d1Data = await getD1DatabaseData(c.env.DB)
+  const nowStr = new Date(Date.now() + 8 * 3600 * 1000).toISOString().substring(0, 10)
+  const filename = `student-score-platform-d1-backup-${nowStr}.json`
+  const encodedFilename = encodeURIComponent(filename)
+  c.header('Content-Type', 'application/json; charset=utf-8')
+  c.header('Content-Disposition', `attachment; filename="${encodedFilename}"; filename*=UTF-8''${encodedFilename}`)
+  return c.body(JSON.stringify(d1Data, null, 2))
+})
+
+// 多元 CSV 資料下載 API (Excel 完美直開 UTF-8 BOM)
 app.get('/api/export/csv', async (c) => {
-  const data = await computeTeacherDashboard(c.env.DB)
+  const type = (c.req.query('type') || 'matrix').toLowerCase()
+  const db = c.env.DB
+
+  // 1. 學生名冊與密碼表 CSV
+  if (type === 'students') {
+    const { results: students } = await db.prepare(`
+      SELECT id, class_id, seat_no, name, password, status, updated_at 
+      FROM students 
+      ORDER BY CAST(seat_no AS INTEGER) ASC, seat_no ASC
+    `).all<StudentRow>()
+    let csv = '\uFEFF流水號,班級,座號,學生姓名,個人密碼,帳號狀態,最後更新時間\n'
+    ;(students || []).forEach((s) => {
+      csv += `"${s.id}","${s.class_id}","${s.seat_no}","${s.name}","${s.password}","${s.status}","${s.updated_at || ''}"\n`
+    })
+    const filename = '402班_學生名冊與密碼表.csv'
+    const encoded = encodeURIComponent(filename)
+    c.header('Content-Type', 'text/csv; charset=utf-8')
+    c.header('Content-Disposition', `attachment; filename="${encoded}"; filename*=UTF-8''${encoded}`)
+    return c.body(csv)
+  }
+
+  // 2. 評量單元設定清單 CSV
+  if (type === 'units') {
+    const { results: units } = await db.prepare(`
+      SELECT unit_id, subject, unit_name, max_score, is_open, created_at 
+      FROM units 
+      ORDER BY created_at ASC
+    `).all<UnitRow>()
+    let csv = '\uFEFF單元代碼,科目名稱,評量單元名稱,滿分,開放填報,建立時間\n'
+    ;(units || []).forEach((u) => {
+      const openText = u.is_open === 1 ? '開放填報中' : '已關閉'
+      csv += `"${u.unit_id}","${u.subject}","${u.unit_name}",${u.max_score},"${openText}","${u.created_at || ''}"\n`
+    })
+    const filename = '評量單元與科目設定清單.csv'
+    const encoded = encodeURIComponent(filename)
+    c.header('Content-Type', 'text/csv; charset=utf-8')
+    c.header('Content-Disposition', `attachment; filename="${encoded}"; filename*=UTF-8''${encoded}`)
+    return c.body(csv)
+  }
+
+  // 3. 原始歷史成績明細紀錄 CSV
+  if (type === 'scores') {
+    const { results: scores } = await db.prepare(`
+      SELECT id, record_id, submitted_at, class_id, seat_no, student_name, unit_id, subject, unit_name, score, note 
+      FROM scores 
+      ORDER BY submitted_at DESC, CAST(seat_no AS INTEGER) ASC
+    `).all<ScoreRow>()
+    let csv = '\uFEFF記錄流水號,記錄編號,提交時間,班級,座號,學生姓名,單元代碼,科目,評量單元,得分,備註說明\n'
+    ;(scores || []).forEach((r) => {
+      csv += `"${r.id}","${r.record_id}","${r.submitted_at || ''}","${r.class_id}","${r.seat_no}","${r.student_name}","${r.unit_id}","${r.subject}","${r.unit_name}",${r.score},"${r.note || ''}"\n`
+    })
+    const filename = '402班_原始歷史成績明細記錄.csv'
+    const encoded = encodeURIComponent(filename)
+    c.header('Content-Type', 'text/csv; charset=utf-8')
+    c.header('Content-Disposition', `attachment; filename="${encoded}"; filename*=UTF-8''${encoded}`)
+    return c.body(csv)
+  }
+
+  // 4. 預設：全班成績交叉矩陣表 CSV
+  const data = await computeTeacherDashboard(db)
   const students = data.students || []
   const units = data.units || []
   const matrix = data.matrix || []
@@ -723,7 +864,7 @@ app.get('/api/export/csv', async (c) => {
   units.forEach((u: any) => {
     csv += `,"${u.subject} - ${u.name}"`
   })
-  csv += ',已填項目,個人總平均,狀態\n'
+  csv += ',已填項目,個人總平均,填報狀態\n'
 
   students.forEach((stu: any) => {
     const key = `${stu.classId}_${stu.seatNo}`
@@ -737,10 +878,13 @@ app.get('/api/export/csv', async (c) => {
     csv += `,${item.filledOpenCount || 0}/${item.totalOpenCount || 0},${item.average !== null ? item.average : ''},${statusText}\n`
   })
 
+  const filename = '402班_學生成績總矩陣表.csv'
+  const encoded = encodeURIComponent(filename)
   c.header('Content-Type', 'text/csv; charset=utf-8')
-  c.header('Content-Disposition', 'attachment; filename="402班_學生成績總矩陣表.csv"')
+  c.header('Content-Disposition', `attachment; filename="${encoded}"; filename*=UTF-8''${encoded}`)
   return c.body(csv)
 })
+
 
 app.get('/api/health', (c) => {
   return c.json({
